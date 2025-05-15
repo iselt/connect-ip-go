@@ -43,6 +43,14 @@ const (
 // On IPv6, the minimum MTU of a link is 1280 bytes.
 const minMTU = 1280
 
+// 访问控制策略结构体
+// Action: "allow" 或 "deny"
+type AccessPolicy struct {
+	Action   string       // "allow" or "deny"
+	IPPrefix netip.Prefix // 目标IP前缀
+	Priority int          // 优先级，数字越小优先级越高
+}
+
 // Conn is a connection that proxies IP packets over HTTP/3.
 type Conn struct {
 	str    http3.Stream
@@ -59,6 +67,12 @@ type Conn struct {
 
 	closeChan chan struct{}
 	closeErr  error
+
+	// 服务端访问控制相关字段
+	clientID string
+	groupIDs []string
+	policies []AccessPolicy // 按优先级升序排列
+	isServer bool           // 是否为服务端实例
 }
 
 func newProxiedConn(str http3.Stream) *Conn {
@@ -92,6 +106,35 @@ func newProxiedConn(str http3.Stream) *Conn {
 		}
 	}()
 	return c
+}
+
+// 设置访问控制相关信息（仅服务端调用）
+func (c *Conn) SetAccessControl(clientID string, groupIDs []string, policies []AccessPolicy) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clientID = clientID
+	c.groupIDs = append([]string{}, groupIDs...)
+	c.policies = append([]AccessPolicy{}, policies...)
+	c.isServer = true
+}
+
+// 目的地访问控制匹配
+func (c *Conn) checkAccessPolicy(dst netip.Addr) bool {
+	c.mu.Lock()
+	policies := append([]AccessPolicy{}, c.policies...)
+	c.mu.Unlock()
+	// 按优先级升序遍历
+	for _, p := range policies {
+		if p.IPPrefix.Contains(dst) {
+			if p.Action == "allow" {
+				return true
+			} else if p.Action == "deny" {
+				return false
+			}
+		}
+	}
+	// 没有匹配策略，默认拒绝
+	return false
 }
 
 // AdvertiseRoute informs the peer about available routes.
@@ -367,10 +410,10 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 }
 
 func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
-	// TODO: implement src, dst and ipproto checks
 	if len(b) == 0 {
 		return nil, nil
 	}
+	var dst netip.Addr
 	switch v := ipVersion(b); v {
 	default:
 		return nil, fmt.Errorf("connect-ip: unknown IP versions: %d", v)
@@ -378,6 +421,8 @@ func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
 		if len(b) < ipv4.HeaderLen {
 			return nil, fmt.Errorf("connect-ip: IPv4 packet too short")
 		}
+		dst = netip.AddrFrom4([4]byte(b[16:20]))
+		// ipProto = b[9] // Protocol field
 		ttl := b[8]
 		if ttl <= 1 {
 			return nil, fmt.Errorf("connect-ip: datagram TTL too small: %d", ttl)
@@ -389,11 +434,19 @@ func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
 		if len(b) < ipv6.HeaderLen {
 			return nil, fmt.Errorf("connect-ip: IPv6 packet too short")
 		}
+		dst = netip.AddrFrom16([16]byte(b[24:40]))
+		// ipProto = b[6] // Next Header field
 		hopLimit := b[7]
 		if hopLimit <= 1 {
 			return nil, fmt.Errorf("connect-ip: datagram Hop Limit too small: %d", hopLimit)
 		}
 		b[7]-- // Decrement Hop Limit
+	}
+	// 服务端访问控制：目的地检查
+	if c.isServer {
+		if !c.checkAccessPolicy(dst) {
+			return nil, fmt.Errorf("connect-ip: destination %s denied by access policy", dst)
+		}
 	}
 	data := make([]byte, 0, len(contextIDZero)+len(b))
 	data = append(data, contextIDZero...)
