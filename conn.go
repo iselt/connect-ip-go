@@ -339,10 +339,18 @@ func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
 	}
 
 	c.mu.Lock()
+	isSrv := c.isServer
 	assignedAddresses := c.assignedAddresses
 	localRoutes := c.localRoutes
 	peerAddresses := c.peerAddresses
 	c.mu.Unlock()
+
+	// 新增：服务端对来自客户端的数据包进行目标地址访问控制检查
+	if isSrv {
+		if !c.checkAccessPolicy(dst) {
+			return fmt.Errorf("connect-ip: destination %s (from client %s) denied by access policy", dst, src)
+		}
+	}
 
 	// We don't necessarily assign any addresses to the peer.
 	// For example, in the Remote Access VPN use case (RFC 9484, section 8.1),
